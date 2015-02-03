@@ -96,6 +96,9 @@ extern    "C" {
         size_t     file_len; /* total size of the rrd file */
         size_t     pos;  /* current pos in file */
         void      *pvt;
+#ifdef HAVE_LIBRADOS
+        struct rrd_rados_t *rados;
+#endif
     } rrd_file_t;
 
 /* information used for the conventional file access methods */

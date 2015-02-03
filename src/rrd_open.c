@@ -20,6 +20,10 @@
 #include <utime.h>
 #endif
 
+#ifdef HAVE_LIBRADOS
+#include "rrd_rados.h"
+#endif
+
 #define MEMBLK 8192
 
 #ifdef WIN32
@@ -48,7 +52,7 @@
 /* the cast to void* is there to avoid this warning seen on ia64 with certain
    versions of gcc: 'cast increases required alignment of target type'
 */
-#define __rrd_read(dst, dst_t, cnt) { \
+#define __rrd_read_mmap(dst, dst_t, cnt) { \
 	size_t wanted = sizeof(dst_t)*(cnt); \
 	if (offset + wanted > rrd_file->file_len) { \
 		rrd_set_error("reached EOF while loading header " #dst); \
@@ -58,7 +62,7 @@
 	offset += wanted; \
     }
 #else
-#define __rrd_read(dst, dst_t, cnt) { \
+#define __rrd_read_seq(dst, dst_t, cnt) { \
 	size_t wanted = sizeof(dst_t)*(cnt); \
         size_t got; \
 	if ((dst = (dst_t*)malloc(wanted)) == NULL) { \
@@ -72,6 +76,44 @@
 	} \
 	offset += got; \
     }
+#endif
+
+#ifdef HAVE_LIBRADOS
+#define __rrd_read_rados(dst, dst_t, cnt) { \
+	size_t wanted = sizeof(dst_t)*(cnt); \
+        size_t got; \
+	if ((dst = (dst_t*)malloc(wanted)) == NULL) { \
+		rrd_set_error(#dst " malloc"); \
+		goto out_nullify_head; \
+	} \
+        got = rrd_rados_read(rrd_file->rados, dst, wanted, offset); \
+	if (got != wanted) { \
+		rrd_set_error("short read while reading header " #dst); \
+                goto out_nullify_head; \
+	} \
+	offset += got; \
+    }
+#endif
+
+#if defined(HAVE_LIBRADOS) && defined(HAVE_MMAP)
+#define __rrd_read(dst, dst_t, cnt) { \
+    if (rrd_file->rados) \
+      __rrd_read_rados(dst, dst_t, cnt) \
+    else \
+      __rrd_read_mmap(dst, dst_t, cnt) \
+    }
+#elif defined(HAVE_LIBRADOS) && !defined(HAVE_MMAP)
+    if (rrd_file->rados) \
+      __rrd_read_rados(dst, dst_t, cnt) \
+    else \
+      __rrd_read_seq(dst, dst_t, cnt) \
+    }
+#elif defined(HAVE_MMAP)
+#define __rrd_read(dst, dst_t, cnt) \
+    __rrd_read_mmap(dst, dst_t, cnt)
+#else
+#define __rrd_read(dst, dst_t, cnt) \
+    __rrd_read_seq(dst, dst_t, cnt)
 #endif
 
 /* get the address of the start of this page */
@@ -146,6 +188,19 @@ rrd_file_t *rrd_open(
         /* Both READONLY and READWRITE were given, which is invalid.  */
         rrd_set_error("in read/write request mask");
         exit(-1);
+    }
+#endif
+
+#ifdef HAVE_LIBRADOS
+    if (strncmp("ceph//", file_name, 6) == 0) {
+      rrd_file->rados = rrd_rados_open(file_name + 6);
+      if (rrd_file->rados == NULL)
+          goto out_free;
+
+      if (rdwr & RRD_CREAT)
+          goto out_done;
+
+      goto read_check;
     }
 #endif
 
@@ -316,6 +371,10 @@ rrd_file_t *rrd_open(
     }
 #endif
 
+#ifdef HAVE_LIBRADOS
+read_check:
+#endif
+
     __rrd_read(rrd->stat_head, stat_head_t,
                1);
 
@@ -396,6 +455,13 @@ rrd_file_t *rrd_open(
 
       size_t  correct_len = rrd_file->header_len +
         sizeof(rrd_value_t) * row_cnt * rrd->stat_head->ds_cnt;
+
+#ifdef HAVE_LIBRADOS
+      /* skip length checking for rados file */
+      if (rrd_file->rados) {
+        rrd_file->file_len = correct_len;
+      }
+#endif
 
       if (correct_len > rrd_file->file_len)
       {
@@ -479,6 +545,10 @@ void mincore_print(
 int rrd_lock(
     rrd_file_t *rrd_file)
 {
+#ifdef HAVE_LIBRADOS
+      if (rrd_file->rados)
+          return rrd_rados_lock(rrd_file->rados);
+#endif
     int       rcstat;
     rrd_simple_file_t *rrd_simple_file;
     rrd_simple_file = (rrd_simple_file_t *)rrd_file->pvt;
@@ -594,6 +664,13 @@ int rrd_close(
     rrd_simple_file = (rrd_simple_file_t *)rrd_file->pvt;
     int       ret;
 
+#ifdef HAVE_LIBRADOS
+    if (rrd_file->rados) {
+        ret = rrd_rados_close(rrd_file->rados);
+        goto end;
+    }
+#endif
+
 #ifdef HAVE_MMAP
     ret = msync(rrd_simple_file->file_start, rrd_file->file_len, MS_ASYNC);
     if (ret != 0)
@@ -603,6 +680,11 @@ int rrd_close(
         rrd_set_error("munmap rrd_file: %s", rrd_strerror(errno));
 #endif
     ret = close(rrd_simple_file->fd);
+
+#ifdef HAVE_LIBRADOS
+end:
+#endif
+
     if (ret != 0)
         rrd_set_error("closing file: %s", rrd_strerror(errno));
     free(rrd_file->pvt);
@@ -619,6 +701,14 @@ off_t rrd_seek(
     off_t off,
     int whence)
 {
+#ifdef HAVE_LIBRADOS
+  /* no seek for rados */
+  if (rrd_file->rados) {
+    rrd_file->pos = off;
+    return 0;
+  }
+#endif
+
     off_t     ret = 0;
 #ifndef HAVE_MMAP
     rrd_simple_file_t *rrd_simple_file;
@@ -660,6 +750,14 @@ ssize_t rrd_read(
     void *buf,
     size_t count)
 {
+#ifdef HAVE_LIBRADOS
+    if (rrd_file->rados) {
+        ssize_t ret = rrd_rados_read(rrd_file->rados, buf, count, rrd_file->pos);
+        if (ret > 0)
+            rrd_file->pos += ret;
+        return ret;
+    }
+#endif
     rrd_simple_file_t *rrd_simple_file = (rrd_simple_file_t *)rrd_file->pvt;
 #ifdef HAVE_MMAP
     size_t    _cnt = count;
@@ -699,6 +797,14 @@ ssize_t rrd_write(
     const void *buf,
     size_t count)
 {
+#ifdef HAVE_LIBRADOS
+    if (rrd_file->rados) {
+      size_t ret = rrd_rados_write(rrd_file->rados, buf, count, rrd_file->pos);
+      if (ret > 0)
+        rrd_file->pos += count;
+      return ret;
+    }
+#endif
     rrd_simple_file_t *rrd_simple_file = (rrd_simple_file_t *)rrd_file->pvt;
 #ifdef HAVE_MMAP
     size_t old_size = rrd_file->file_len;
